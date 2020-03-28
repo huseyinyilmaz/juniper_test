@@ -1,46 +1,55 @@
-#[macro_use] extern crate juniper;
+use hyper::{
+    service::{make_service_fn, service_fn},
+    Body, Method, Response, Server, StatusCode,
+};
+use juniper::{
+    tests::{model::Database, schema::Query},
+    EmptyMutation, EmptySubscription, RootNode,
+};
+use std::sync::Arc;
 
-use juniper::{FieldResult, Variables, EmptyMutation};
+#[tokio::main]
+async fn main() {
+    pretty_env_logger::init();
 
-#[derive(GraphQLEnum, Clone, Copy)]
-enum Episode {
-    NewHope,
-    Empire,
-    Jedi,
-}
+    let addr = ([127, 0, 0, 1], 3000).into();
 
-struct Query;
+    let db = Arc::new(Database::new());
+    let root_node = Arc::new(RootNode::new(
+        Query,
+        EmptyMutation::<Database>::new(),
+        EmptySubscription::<Database>::new(),
+    ));
 
-graphql_object!(Query: Ctx |&self| {
-    field favoriteEpisode(&executor) -> FieldResult<Episode> {
-        // Use the special &executor argument to fetch our fav episode.
-        Ok(executor.context().0)
+    let new_service = make_service_fn(move |_| {
+        let root_node = root_node.clone();
+        let ctx = db.clone();
+
+        async move {
+            Ok::<_, hyper::Error>(service_fn(move |req| {
+                let root_node = root_node.clone();
+                let ctx = ctx.clone();
+                async move {
+                    match (req.method(), req.uri().path()) {
+                        (&Method::GET, "/") => juniper_hyper::graphiql("/graphql").await,
+                        (&Method::GET, "/graphql") | (&Method::POST, "/graphql") => {
+                            juniper_hyper::graphql(root_node, ctx, req).await
+                        }
+                        _ => {
+                            let mut response = Response::new(Body::empty());
+                            *response.status_mut() = StatusCode::NOT_FOUND;
+                            Ok(response)
+                        }
+                    }
+                }
+            }))
+        }
+    });
+
+    let server = Server::bind(&addr).serve(new_service);
+    println!("Listening on http://{}", addr);
+
+    if let Err(e) = server.await {
+        eprintln!("server error: {}", e)
     }
-});
-
-// Arbitrary context data.
-struct Ctx(Episode);
-
-// A root schema consists of a query and a mutation.
-// Request queries can be executed against a RootNode.
-type Schema = juniper::RootNode<'static, Query, EmptyMutation<Ctx>>;
-
-fn main() {
-    // Create a context object.
-    let ctx = Ctx(Episode::NewHope);
-
-    // Run the executor.
-    let (res, _errors) = juniper::execute(
-        "query { favoriteEpisode }",
-        None,
-        &Schema::new(Query, EmptyMutation::new()),
-        &Variables::new(),
-        &ctx,
-    ).unwrap();
-
-    // Ensure the value matches.
-    assert_eq!(
-        res.as_object_value().unwrap().get_field_value("favoriteEpisode").unwrap().as_string_value().unwrap(),
-        "NEW_HOPE",
-    );
 }
